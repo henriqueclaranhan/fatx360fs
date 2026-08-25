@@ -71,7 +71,6 @@ impl FatxFileSystem {
         let fat_size_aligned = (fat_size_bytes + 4095) / 4096 * 4096;
         let cluster_offset = fat_offset + fat_size_aligned;
 
-        // Load the entire FAT into memory for blazing fast reads
         let mut fat_data = vec![0u8; fat_size_aligned as usize];
         device.seek(SeekFrom::Start(fat_offset))?;
         device.read_exact(&mut fat_data)?;
@@ -328,7 +327,6 @@ impl FatxFileSystem {
 
         let mut current_cluster = first_cluster;
 
-        // Walk chain to the starting cluster for this write
         for _ in 0..start_cluster_idx {
             match self.get_next_cluster(current_cluster)? {
                 Some(next) => current_cluster = next,
@@ -350,13 +348,11 @@ impl FatxFileSystem {
             );
 
             if current_offset_in_cluster == 0 && bytes_to_write == self.cluster_size as usize {
-                // Full cluster write, skip read
                 self.write_cluster(
                     current_cluster,
                     &data[data_offset..data_offset + bytes_to_write],
                 )?;
             } else {
-                // Partial cluster write, read-modify-write
                 let mut cluster_data = self.read_cluster(current_cluster)?;
                 cluster_data[current_offset_in_cluster..current_offset_in_cluster + bytes_to_write]
                     .copy_from_slice(&data[data_offset..data_offset + bytes_to_write]);

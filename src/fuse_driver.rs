@@ -41,7 +41,7 @@ fn generate_ino(parent_ino: u64, name: &str) -> u64 {
     name.hash(&mut hasher);
     let mut hash = hasher.finish();
     if hash == 1 {
-        hash = 2; // Avoid collision with root
+        hash = 2;
     }
     hash
 }

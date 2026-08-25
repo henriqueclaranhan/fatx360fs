@@ -131,7 +131,6 @@ impl FatxRawDirectoryEntry {
         let mut days = seconds_since_1970 / seconds_per_day;
         let mut seconds_in_day = seconds_since_1970 % seconds_per_day;
 
-        // Simple manual date calculation starting from 1970
         let mut year = 1970;
         loop {
             let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
