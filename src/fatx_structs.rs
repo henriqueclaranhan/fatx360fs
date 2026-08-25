@@ -1,6 +1,6 @@
-use byteorder::{BigEndian, ReadBytesExt};
-use std::io::{self, Cursor, Read};
-
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{self, Cursor, Read, Write};
+use std::time::{SystemTime, UNIX_EPOCH};
 pub const FATX_SIGNATURE: u32 = 0x58544146; // 'XTAF'
 pub const FATX_SUPERBLOCK_SIZE: usize = 4096;
 pub const FATX_DELETED_FILE_MARKER: u8 = 0xE5;
@@ -62,16 +62,17 @@ pub struct FatxRawDirectoryEntry {
 impl FatxRawDirectoryEntry {
     pub fn read_from(data: &[u8; 64]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data.as_ref());
-        
+
         let filename_len = cursor.read_u8()?;
         let attributes = cursor.read_u8()?;
-        
+
         let mut filename_bytes = [0u8; 42];
         cursor.read_exact(&mut filename_bytes)?;
-        
+
         let actual_len = std::cmp::min(filename_len as usize, 42);
-        let filename = String::from_utf8_lossy(&filename_bytes.as_slice()[..actual_len]).to_string();
-        
+        let filename =
+            String::from_utf8_lossy(&filename_bytes.as_slice()[..actual_len]).to_string();
+
         let first_cluster = cursor.read_u32::<BigEndian>()?;
         let file_size = cursor.read_u32::<BigEndian>()?;
         let modified_time = cursor.read_u16::<BigEndian>()?;
@@ -94,5 +95,96 @@ impl FatxRawDirectoryEntry {
             accessed_time,
             accessed_date,
         })
+    }
+
+    pub fn write_to(&self) -> [u8; 64] {
+        let mut data = [0u8; 64];
+        let mut cursor = Cursor::new(&mut data[..]);
+
+        cursor.write_u8(self.filename_len).unwrap();
+        cursor.write_u8(self.attributes).unwrap();
+
+        let mut name_bytes = self.filename.as_bytes().to_vec();
+        name_bytes.resize(42, 0);
+        cursor.write_all(&name_bytes).unwrap();
+
+        cursor.write_u32::<BigEndian>(self.first_cluster).unwrap();
+        cursor.write_u32::<BigEndian>(self.file_size).unwrap();
+        cursor.write_u16::<BigEndian>(self.modified_time).unwrap();
+        cursor.write_u16::<BigEndian>(self.modified_date).unwrap();
+        cursor.write_u16::<BigEndian>(self.created_time).unwrap();
+        cursor.write_u16::<BigEndian>(self.created_date).unwrap();
+        cursor.write_u16::<BigEndian>(self.accessed_time).unwrap();
+        cursor.write_u16::<BigEndian>(self.accessed_date).unwrap();
+
+        data
+    }
+
+    pub fn systemtime_to_fatx_datetime(time: SystemTime) -> (u16, u16) {
+        let duration = time
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let seconds_since_1970 = duration as i64;
+
+        let seconds_per_day = 86400;
+        let mut days = seconds_since_1970 / seconds_per_day;
+        let mut seconds_in_day = seconds_since_1970 % seconds_per_day;
+
+        // Simple manual date calculation starting from 1970
+        let mut year = 1970;
+        loop {
+            let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            let days_in_year = if is_leap { 366 } else { 365 };
+            if days >= days_in_year {
+                days -= days_in_year;
+                year += 1;
+            } else {
+                break;
+            }
+        }
+
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_month = [
+            31,
+            if is_leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+
+        let mut month = 1;
+        for &dim in &days_in_month {
+            if days >= dim {
+                days -= dim;
+                month += 1;
+            } else {
+                break;
+            }
+        }
+
+        let day = days + 1;
+
+        let hours = seconds_in_day / 3600;
+        seconds_in_day %= 3600;
+        let minutes = seconds_in_day / 60;
+        let seconds = seconds_in_day % 60;
+
+        let fat_year = std::cmp::max(1980, year) - 1980;
+
+        let fat_date =
+            ((fat_year as u16 & 0x7F) << 9) | ((month as u16 & 0x0F) << 5) | (day as u16 & 0x1F);
+        let fat_time = ((hours as u16 & 0x1F) << 11)
+            | ((minutes as u16 & 0x3F) << 5)
+            | ((seconds as u16 / 2) & 0x1F);
+
+        (fat_time, fat_date)
     }
 }
