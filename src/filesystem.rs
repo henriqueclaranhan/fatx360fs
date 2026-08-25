@@ -2,10 +2,9 @@ use crate::fatx_structs::{
     FATX_DELETED_FILE_MARKER, FATX_END_OF_DIR_MARKER, FATX_END_OF_DIR_MARKER2,
     FATX_SUPERBLOCK_SIZE, FatxRawDirectoryEntry, FatxSuperblock,
 };
-use byteorder::WriteBytesExt;
-use byteorder::{BigEndian, ReadBytesExt};
+
 use std::fs::{File, OpenOptions};
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
@@ -23,6 +22,7 @@ pub struct FatxFileSystem {
     pub cluster_offset: u64,
     pub cluster_size: u64,
     pub fat_data: Vec<u8>,
+    pub next_free_cluster: u32,
 }
 
 impl FatxFileSystem {
@@ -86,6 +86,7 @@ impl FatxFileSystem {
             cluster_offset,
             cluster_size,
             fat_data,
+            next_free_cluster: 2,
         })
     }
 
@@ -105,15 +106,14 @@ impl FatxFileSystem {
 
     pub fn get_next_cluster(&self, cluster: u32) -> io::Result<Option<u32>> {
         let index = cluster as usize * (if self.is_fat32 { 4 } else { 2 });
-        if index + 4 > self.fat_data.len() {
+        if index + (if self.is_fat32 { 4 } else { 2 }) > self.fat_data.len() {
             return Ok(None);
         }
 
-        let mut cursor = Cursor::new(&self.fat_data[index..index + 4]);
         let next_cluster = if self.is_fat32 {
-            cursor.read_u32::<BigEndian>()?
+            u32::from_be_bytes(self.fat_data[index..index + 4].try_into().unwrap())
         } else {
-            cursor.read_u16::<BigEndian>()? as u32
+            u16::from_be_bytes(self.fat_data[index..index + 2].try_into().unwrap()) as u32
         };
 
         if (self.is_fat32 && next_cluster >= 0xFFFFFFF8)
@@ -243,11 +243,10 @@ impl FatxFileSystem {
             ));
         }
 
-        let mut cursor = Cursor::new(&mut self.fat_data[index..]);
         if self.is_fat32 {
-            cursor.write_u32::<BigEndian>(value)?;
+            self.fat_data[index..index + 4].copy_from_slice(&value.to_be_bytes());
         } else {
-            cursor.write_u16::<BigEndian>(value as u16)?;
+            self.fat_data[index..index + 2].copy_from_slice(&(value as u16).to_be_bytes());
         }
 
         Ok(())
@@ -257,18 +256,25 @@ impl FatxFileSystem {
         let entry_size = if self.is_fat32 { 4 } else { 2 };
         let num_entries = self.fat_data.len() / entry_size;
 
-        for cluster in 2..num_entries as u32 {
+        let start_search = std::cmp::max(2, self.next_free_cluster);
+
+        for i in 0..(num_entries as u32 - 2) {
+            let mut cluster = start_search + i;
+            if cluster >= num_entries as u32 {
+                cluster = cluster - (num_entries as u32 - 2);
+            }
+
             let index = cluster as usize * entry_size;
-            let mut cursor = Cursor::new(&self.fat_data[index..index + entry_size]);
             let value = if self.is_fat32 {
-                cursor.read_u32::<BigEndian>()?
+                u32::from_be_bytes(self.fat_data[index..index + 4].try_into().unwrap())
             } else {
-                cursor.read_u16::<BigEndian>()? as u32
+                u16::from_be_bytes(self.fat_data[index..index + 2].try_into().unwrap()) as u32
             };
 
             if value == 0 {
                 let eoc = if self.is_fat32 { 0xFFFFFFFF } else { 0xFFFF };
                 self.set_fat_entry(cluster, eoc)?;
+                self.next_free_cluster = cluster + 1;
                 return Ok(cluster);
             }
         }
@@ -312,60 +318,68 @@ impl FatxFileSystem {
         offset: u64,
         data: &[u8],
     ) -> io::Result<(u32, u32)> {
-        let mut chain = self.get_cluster_chain(start_cluster)?;
-        let mut current_cluster = start_cluster;
+        let mut first_cluster = start_cluster;
+        if first_cluster == 0 {
+            first_cluster = self.allocate_cluster()?;
+        }
 
-        if current_cluster == 0 {
-            current_cluster = self.allocate_cluster()?;
-            chain.push(current_cluster);
+        let start_cluster_idx = (offset / self.cluster_size) as usize;
+        let mut current_offset_in_cluster = (offset % self.cluster_size) as usize;
+
+        let mut current_cluster = first_cluster;
+
+        // Walk chain to the starting cluster for this write
+        for _ in 0..start_cluster_idx {
+            match self.get_next_cluster(current_cluster)? {
+                Some(next) => current_cluster = next,
+                None => {
+                    let new_cluster = self.allocate_cluster()?;
+                    self.set_fat_entry(current_cluster, new_cluster)?;
+                    current_cluster = new_cluster;
+                }
+            }
         }
 
         let mut data_offset = 0;
         let mut bytes_written = 0;
 
-        let start_cluster_idx = (offset / self.cluster_size) as usize;
-        let offset_in_cluster = (offset % self.cluster_size) as usize;
-
-        while chain.len() <= start_cluster_idx {
-            let new_cluster = self.allocate_cluster()?;
-            let last_cluster = *chain.last().unwrap();
-            self.set_fat_entry(last_cluster, new_cluster)?;
-            chain.push(new_cluster);
-        }
-
-        let mut chain_idx = start_cluster_idx;
-        let mut current_offset_in_cluster = offset_in_cluster;
-
         while data_offset < data.len() {
-            if chain_idx >= chain.len() {
-                let new_cluster = self.allocate_cluster()?;
-                let last_cluster = *chain.last().unwrap();
-                self.set_fat_entry(last_cluster, new_cluster)?;
-                chain.push(new_cluster);
-            }
-
-            let cluster = chain[chain_idx];
             let bytes_to_write = std::cmp::min(
                 self.cluster_size as usize - current_offset_in_cluster,
                 data.len() - data_offset,
             );
 
             if current_offset_in_cluster == 0 && bytes_to_write == self.cluster_size as usize {
-                self.write_cluster(cluster, &data[data_offset..data_offset + bytes_to_write])?;
+                // Full cluster write, skip read
+                self.write_cluster(
+                    current_cluster,
+                    &data[data_offset..data_offset + bytes_to_write],
+                )?;
             } else {
-                let mut cluster_data = self.read_cluster(cluster)?;
+                // Partial cluster write, read-modify-write
+                let mut cluster_data = self.read_cluster(current_cluster)?;
                 cluster_data[current_offset_in_cluster..current_offset_in_cluster + bytes_to_write]
                     .copy_from_slice(&data[data_offset..data_offset + bytes_to_write]);
-                self.write_cluster(cluster, &cluster_data)?;
+                self.write_cluster(current_cluster, &cluster_data)?;
             }
 
             data_offset += bytes_to_write;
             bytes_written += bytes_to_write;
             current_offset_in_cluster = 0;
-            chain_idx += 1;
+
+            if data_offset < data.len() {
+                match self.get_next_cluster(current_cluster)? {
+                    Some(next) => current_cluster = next,
+                    None => {
+                        let new_cluster = self.allocate_cluster()?;
+                        self.set_fat_entry(current_cluster, new_cluster)?;
+                        current_cluster = new_cluster;
+                    }
+                }
+            }
         }
 
-        Ok((chain[0], offset as u32 + bytes_written as u32))
+        Ok((first_cluster, offset as u32 + bytes_written as u32))
     }
 
     pub fn truncate_chain(
