@@ -54,5 +54,6 @@ fn main() {
     println!("Mounting to {}...", mountpoint);
     let mut config = fuser::Config::default();
     config.mount_options = options;
+    config.n_threads = Some(16);
     fuser::mount(driver, mountpoint, &config).unwrap();
 }
