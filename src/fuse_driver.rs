@@ -102,7 +102,7 @@ impl FatxDriver {
 
     /// Flush all dirty inode metadata to disk directory entries
     fn sync_dirty_inodes(&self) -> std::io::Result<()> {
-        let dirty_inos: Vec<u64> = self.dirty_inodes.lock().unwrap().drain().collect();
+        let dirty_inos: Vec<u64> = self.dirty_inodes.lock().unwrap().iter().copied().collect();
         if dirty_inos.is_empty() {
             return Ok(());
         }
@@ -112,9 +112,12 @@ impl FatxDriver {
         let (mod_time, mod_date) =
             FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
 
+        let mut synced_inos = Vec::new();
+
         for ino in &dirty_inos {
             if let Some(data) = inodes.get(ino) {
                 if !data.dirty || data.parent_cluster == 0 {
+                    synced_inos.push(*ino);
                     continue;
                 }
                 if let Ok(entries) = fs.read_directory(data.parent_cluster) {
@@ -126,22 +129,29 @@ impl FatxDriver {
                         updated.modified_date = mod_date;
                         updated.accessed_time = mod_time;
                         updated.accessed_date = mod_date;
-                        let _ =
-                            fs.update_directory_entry(data.parent_cluster, &data.name, &updated);
+                        if fs
+                            .update_directory_entry(data.parent_cluster, &data.name, &updated)
+                            .is_ok()
+                        {
+                            synced_inos.push(*ino);
+                        }
                     }
                 }
             }
         }
         drop(inodes);
 
+        fs.flush_fat()?;
+
         let mut inodes = self.inodes.lock().unwrap();
-        for ino in &dirty_inos {
-            if let Some(data) = inodes.get_mut(ino) {
+        let mut dirty_inodes = self.dirty_inodes.lock().unwrap();
+        for ino in synced_inos {
+            if let Some(data) = inodes.get_mut(&ino) {
                 data.dirty = false;
             }
+            dirty_inodes.remove(&ino);
         }
 
-        fs.flush_fat()?;
         Ok(())
     }
 }
@@ -230,14 +240,28 @@ impl Filesystem for FatxDriver {
             return;
         }
 
-        let mut remove = false;
+        let mut should_remove = false;
+        let mut is_dirty = false;
         if let Some(data) = self.inodes.lock().unwrap().get_mut(&ino_u64) {
             data.lookup_count = data.lookup_count.saturating_sub(nlookup);
             if data.lookup_count == 0 {
-                remove = true;
+                if data.dirty {
+                    is_dirty = true;
+                } else {
+                    should_remove = true;
+                }
             }
         }
-        if remove {
+
+        if is_dirty {
+            let _ = self.sync_dirty_inodes();
+            let mut inodes = self.inodes.lock().unwrap();
+            if let Some(data) = inodes.get(&ino_u64) {
+                if data.lookup_count == 0 && !data.dirty {
+                    inodes.remove(&ino_u64);
+                }
+            }
+        } else if should_remove {
             self.inodes.lock().unwrap().remove(&ino_u64);
         }
     }
@@ -446,6 +470,11 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        if let Err(_) = fs.flush_fat() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
         let new_data = InodeData {
             ino: target_ino,
             parent_ino: parent_u64,
@@ -540,6 +569,11 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        if let Err(_) = fs.flush_fat() {
+            reply.error(Errno::EIO);
+            return;
+        }
+
         let new_data = InodeData {
             ino: target_ino,
             parent_ino: parent_u64,
@@ -601,6 +635,9 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        let _ = fs.flush_fat();
+
+        self.dirty_inodes.lock().unwrap().remove(&target_ino);
         self.inodes.lock().unwrap().remove(&target_ino);
         reply.ok();
     }
@@ -668,6 +705,9 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        let _ = fs.flush_fat();
+
+        self.dirty_inodes.lock().unwrap().remove(&target_ino);
         self.inodes.lock().unwrap().remove(&target_ino);
         reply.ok();
     }
@@ -729,6 +769,9 @@ impl Filesystem for FatxDriver {
                     let _ = fs.free_chain(existing.first_cluster);
                 }
                 let _ = fs.remove_directory_entry(newparent_data.start_cluster, &newname_str);
+                let existing_ino = generate_ino(newparent_u64, &newname_str);
+                self.dirty_inodes.lock().unwrap().remove(&existing_ino);
+                self.inodes.lock().unwrap().remove(&existing_ino);
             }
         }
 
@@ -760,8 +803,15 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        let _ = fs.flush_fat();
+
         let old_ino = generate_ino(parent_u64, &name_str);
         let new_ino = generate_ino(newparent_u64, &newname_str);
+
+        let mut dirty_inodes = self.dirty_inodes.lock().unwrap();
+        if dirty_inodes.remove(&old_ino) {
+            dirty_inodes.insert(new_ino);
+        }
 
         let mut inodes = self.inodes.lock().unwrap();
         if let Some(mut data) = inodes.remove(&old_ino) {
@@ -847,7 +897,10 @@ impl Filesystem for FatxDriver {
             if let Some(d) = self.inodes.lock().unwrap().get_mut(&ino_u64) {
                 d.size = inode_data.size;
                 d.start_cluster = inode_data.start_cluster;
+                d.dirty = false;
             }
+            self.dirty_inodes.lock().unwrap().remove(&ino_u64);
+            let _ = fs.flush_fat();
         }
 
         let attr = self.make_attr(&inode_data);
@@ -890,6 +943,13 @@ impl Filesystem for FatxDriver {
             reply.ok();
         } else {
             reply.error(Errno::EIO);
+        }
+    }
+
+    fn destroy(&mut self) {
+        let _ = self.sync_dirty_inodes();
+        if let Ok(mut fs) = self.fs.lock() {
+            let _ = fs.flush_fat();
         }
     }
 }
