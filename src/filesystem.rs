@@ -3,8 +3,10 @@ use crate::fatx_structs::{
     FATX_SUPERBLOCK_SIZE, FatxRawDirectoryEntry, FatxSuperblock,
 };
 
+use lru::LruCache;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::num::NonZeroUsize;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 
@@ -24,6 +26,8 @@ pub struct FatxFileSystem {
     pub fat_data: Vec<u8>,
     pub next_free_cluster: u32,
     pub free_clusters: u32,
+    pub cluster_cache: LruCache<u32, Vec<u8>>,
+    pub cluster_chain_hints: LruCache<u32, (usize, u32)>,
 }
 
 impl FatxFileSystem {
@@ -90,6 +94,9 @@ impl FatxFileSystem {
             }
         }
 
+        let cluster_cache = LruCache::new(NonZeroUsize::new(128).unwrap());
+        let cluster_chain_hints = LruCache::new(NonZeroUsize::new(256).unwrap());
+
         Ok(Self {
             device,
             superblock,
@@ -102,6 +109,8 @@ impl FatxFileSystem {
             fat_data,
             next_free_cluster: 2,
             free_clusters,
+            cluster_cache,
+            cluster_chain_hints,
         })
     }
 
@@ -115,10 +124,17 @@ impl FatxFileSystem {
                 ),
             ));
         }
+
+        if let Some(cached) = self.cluster_cache.get(&cluster) {
+            return Ok(cached.clone());
+        }
+
         let offset = self.cluster_offset + ((cluster as u64 - 1) * self.cluster_size);
         self.device.seek(SeekFrom::Start(offset))?;
         let mut data = vec![0u8; self.cluster_size as usize];
         self.device.read_exact(&mut data)?;
+
+        self.cluster_cache.put(cluster, data.clone());
         Ok(data)
     }
 
@@ -150,41 +166,86 @@ impl FatxFileSystem {
         Ok(Some(next_cluster))
     }
 
+    pub fn find_cluster_at_index(
+        &mut self,
+        start_cluster: u32,
+        target_idx: usize,
+    ) -> io::Result<Option<u32>> {
+        if start_cluster == 0 {
+            return Ok(None);
+        }
+        if target_idx == 0 {
+            self.cluster_chain_hints
+                .put(start_cluster, (0, start_cluster));
+            return Ok(Some(start_cluster));
+        }
+
+        let (mut current_idx, mut current_cluster) =
+            match self.cluster_chain_hints.get(&start_cluster) {
+                Some(&(hint_idx, hint_cluster)) if hint_idx <= target_idx => {
+                    (hint_idx, hint_cluster)
+                }
+                _ => (0, start_cluster),
+            };
+
+        while current_idx < target_idx {
+            match self.get_next_cluster(current_cluster)? {
+                Some(next) => {
+                    current_cluster = next;
+                    current_idx += 1;
+                }
+                None => return Ok(None),
+            }
+        }
+
+        self.cluster_chain_hints
+            .put(start_cluster, (target_idx, current_cluster));
+        Ok(Some(current_cluster))
+    }
+
     pub fn read_file_chunk(
         &mut self,
         start_cluster: u32,
         offset: u64,
         size: u32,
     ) -> io::Result<Vec<u8>> {
-        let mut current_cluster = start_cluster;
-        let mut bytes_to_skip = offset;
-
-        while bytes_to_skip >= self.cluster_size {
-            bytes_to_skip -= self.cluster_size;
-            match self.get_next_cluster(current_cluster)? {
-                Some(next) => current_cluster = next,
-                None => return Ok(Vec::new()),
-            }
+        if start_cluster == 0 {
+            return Ok(Vec::new());
         }
 
+        let start_cluster_idx = (offset / self.cluster_size) as usize;
+        let mut current_offset_in_cluster = (offset % self.cluster_size) as usize;
+
+        let mut current_cluster = match self.find_cluster_at_index(start_cluster, start_cluster_idx)? {
+            Some(c) => c,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut current_cluster_idx = start_cluster_idx;
         let mut data = Vec::with_capacity(size as usize);
         let mut remaining_size = size as u64;
 
         while remaining_size > 0 {
             let cluster_data = self.read_cluster(current_cluster)?;
 
-            let start = bytes_to_skip as usize;
-            let available_in_cluster = (self.cluster_size as usize) - start;
+            let available_in_cluster = (self.cluster_size as usize) - current_offset_in_cluster;
             let to_read = std::cmp::min(remaining_size as usize, available_in_cluster);
 
-            data.extend_from_slice(&cluster_data[start..start + to_read]);
+            data.extend_from_slice(
+                &cluster_data[current_offset_in_cluster..current_offset_in_cluster + to_read],
+            );
 
             remaining_size -= to_read as u64;
-            bytes_to_skip = 0;
+            current_offset_in_cluster = 0;
 
             if remaining_size > 0 {
                 match self.get_next_cluster(current_cluster)? {
-                    Some(next) => current_cluster = next,
+                    Some(next) => {
+                        current_cluster = next;
+                        current_cluster_idx += 1;
+                        self.cluster_chain_hints
+                            .put(start_cluster, (current_cluster_idx, current_cluster));
+                    }
                     None => break,
                 }
             }
@@ -255,6 +316,8 @@ impl FatxFileSystem {
         let offset = self.cluster_offset + ((cluster as u64 - 1) * self.cluster_size);
         self.device.seek(SeekFrom::Start(offset))?;
         self.device.write_all(data)?;
+
+        self.cluster_cache.put(cluster, data.to_vec());
         Ok(())
     }
 
@@ -345,10 +408,12 @@ impl FatxFileSystem {
     }
 
     pub fn free_chain(&mut self, start_cluster: u32) -> io::Result<()> {
+        self.cluster_chain_hints.pop(&start_cluster);
         let mut current_cluster = start_cluster;
         while current_cluster != 0 {
             let next_cluster = self.get_next_cluster(current_cluster)?;
             self.set_fat_entry(current_cluster, 0)?;
+            self.cluster_cache.pop(&current_cluster);
             match next_cluster {
                 Some(next) => current_cluster = next,
                 None => break,
@@ -388,21 +453,35 @@ impl FatxFileSystem {
         let start_cluster_idx = (offset / self.cluster_size) as usize;
         let mut current_offset_in_cluster = (offset % self.cluster_size) as usize;
 
-        let mut current_cluster = first_cluster;
+        let (mut current_idx, mut current_cluster) =
+            match self.cluster_chain_hints.get(&first_cluster) {
+                Some(&(hint_idx, hint_cluster)) if hint_idx <= start_cluster_idx => {
+                    (hint_idx, hint_cluster)
+                }
+                _ => (0, first_cluster),
+            };
 
-        for _ in 0..start_cluster_idx {
+        while current_idx < start_cluster_idx {
             match self.get_next_cluster(current_cluster)? {
-                Some(next) => current_cluster = next,
+                Some(next) => {
+                    current_cluster = next;
+                    current_idx += 1;
+                }
                 None => {
                     let new_cluster = self.allocate_cluster()?;
                     self.set_fat_entry(current_cluster, new_cluster)?;
                     current_cluster = new_cluster;
+                    current_idx += 1;
                 }
             }
         }
 
+        self.cluster_chain_hints
+            .put(first_cluster, (start_cluster_idx, current_cluster));
+
         let mut data_offset = 0;
         let mut bytes_written = 0;
+        let mut current_cluster_idx = start_cluster_idx;
 
         while data_offset < data.len() {
             let bytes_to_write = std::cmp::min(
@@ -428,16 +507,24 @@ impl FatxFileSystem {
 
             if data_offset < data.len() {
                 match self.get_next_cluster(current_cluster)? {
-                    Some(next) => current_cluster = next,
+                    Some(next) => {
+                        current_cluster = next;
+                        current_cluster_idx += 1;
+                    }
                     None => {
                         let new_cluster = self.allocate_cluster()?;
                         self.set_fat_entry(current_cluster, new_cluster)?;
                         current_cluster = new_cluster;
+                        current_cluster_idx += 1;
                     }
                 }
+                self.cluster_chain_hints
+                    .put(first_cluster, (current_cluster_idx, current_cluster));
             }
         }
 
+        self.cluster_chain_hints
+            .put(first_cluster, (current_cluster_idx, current_cluster));
         Ok((first_cluster, offset as u32 + bytes_written as u32))
     }
 
@@ -446,6 +533,7 @@ impl FatxFileSystem {
         start_cluster: u32,
         new_cluster_count: u32,
     ) -> io::Result<Option<u32>> {
+        self.cluster_chain_hints.pop(&start_cluster);
         if new_cluster_count == 0 {
             if start_cluster != 0 {
                 self.free_chain(start_cluster)?;
