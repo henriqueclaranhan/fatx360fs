@@ -64,7 +64,7 @@ impl FatxFileSystem {
         let cluster_size = (superblock.sectors_per_cluster as u64) * 512;
         let num_clusters = (partition_size / cluster_size) as u32;
 
-        let is_fat32 = num_clusters > 65524;
+        let is_fat32 = num_clusters >= 0xFFF0;
 
         let fat_offset = 4096;
         let fat_size_bytes = (num_clusters as u64 + 1) * (if is_fat32 { 4 } else { 2 });
@@ -90,10 +90,13 @@ impl FatxFileSystem {
     }
 
     pub fn read_cluster(&mut self, cluster: u32) -> io::Result<Vec<u8>> {
-        if cluster == 0 {
+        if cluster == 0 || cluster > self.num_clusters {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Cluster 0 is invalid",
+                format!(
+                    "Cluster {} is invalid (bounds: 1..={})",
+                    cluster, self.num_clusters
+                ),
             ));
         }
         let offset = self.cluster_offset + ((cluster as u64 - 1) * self.cluster_size);
@@ -104,6 +107,10 @@ impl FatxFileSystem {
     }
 
     pub fn get_next_cluster(&self, cluster: u32) -> io::Result<Option<u32>> {
+        if cluster == 0 || cluster > self.num_clusters {
+            return Ok(None);
+        }
+
         let index = cluster as usize * (if self.is_fat32 { 4 } else { 2 });
         if index + (if self.is_fat32 { 4 } else { 2 }) > self.fat_data.len() {
             return Ok(None);
@@ -115,12 +122,12 @@ impl FatxFileSystem {
             u16::from_be_bytes(self.fat_data[index..index + 2].try_into().unwrap()) as u32
         };
 
-        if (self.is_fat32 && next_cluster >= 0xFFFFFFF8)
-            || (self.is_fat32 == false && next_cluster >= 0xFFF8)
+        if (self.is_fat32 && next_cluster >= 0xFFFFFFF7)
+            || (!self.is_fat32 && next_cluster >= 0xFFF7)
         {
             return Ok(None);
         }
-        if next_cluster == 0 {
+        if next_cluster == 0 || next_cluster > self.num_clusters {
             return Ok(None);
         }
 
@@ -214,10 +221,13 @@ impl FatxFileSystem {
     }
 
     pub fn write_cluster(&mut self, cluster: u32, data: &[u8]) -> io::Result<()> {
-        if cluster == 0 {
+        if cluster == 0 || cluster > self.num_clusters {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Cluster 0 is invalid",
+                format!(
+                    "Cluster {} is invalid (bounds: 1..={})",
+                    cluster, self.num_clusters
+                ),
             ));
         }
         if data.len() as u64 != self.cluster_size {
@@ -233,6 +243,16 @@ impl FatxFileSystem {
     }
 
     pub fn set_fat_entry(&mut self, cluster: u32, value: u32) -> io::Result<()> {
+        if cluster == 0 || cluster > self.num_clusters {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cluster {} is out of bounds (1..={})",
+                    cluster, self.num_clusters
+                ),
+            ));
+        }
+
         let entry_size = if self.is_fat32 { 4 } else { 2 };
         let index = cluster as usize * entry_size;
         if index + entry_size > self.fat_data.len() {
@@ -253,14 +273,22 @@ impl FatxFileSystem {
 
     pub fn allocate_cluster(&mut self) -> io::Result<u32> {
         let entry_size = if self.is_fat32 { 4 } else { 2 };
-        let num_entries = self.fat_data.len() / entry_size;
+        if self.num_clusters < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "No free clusters",
+            ));
+        }
+
+        let total_clusters = self.num_clusters;
+        let cluster_count = total_clusters - 1;
 
         let start_search = std::cmp::max(2, self.next_free_cluster);
 
-        for i in 0..(num_entries as u32 - 2) {
+        for i in 0..cluster_count {
             let mut cluster = start_search + i;
-            if cluster >= num_entries as u32 {
-                cluster = cluster - (num_entries as u32 - 2);
+            if cluster > total_clusters {
+                cluster = 2 + (cluster - total_clusters - 1);
             }
 
             let index = cluster as usize * entry_size;
@@ -273,12 +301,19 @@ impl FatxFileSystem {
             if value == 0 {
                 let eoc = if self.is_fat32 { 0xFFFFFFFF } else { 0xFFFF };
                 self.set_fat_entry(cluster, eoc)?;
-                self.next_free_cluster = cluster + 1;
+                self.next_free_cluster = if cluster >= total_clusters {
+                    2
+                } else {
+                    cluster + 1
+                };
                 return Ok(cluster);
             }
         }
 
-        Err(io::Error::new(io::ErrorKind::Other, "No free clusters"))
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "No free clusters",
+        ))
     }
 
     pub fn free_chain(&mut self, start_cluster: u32) -> io::Result<()> {
@@ -447,6 +482,14 @@ impl FatxFileSystem {
                     return Ok(());
                 }
             }
+        }
+
+        // In FATX, the root directory is strictly restricted to a single cluster
+        if dir_start_cluster == self.superblock.root_cluster {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "FATX root directory is full (limited to 1 cluster)",
+            ));
         }
 
         let new_cluster = self.allocate_cluster()?;

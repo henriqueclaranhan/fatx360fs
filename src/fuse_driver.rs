@@ -462,11 +462,13 @@ impl Filesystem for FatxDriver {
         };
 
         let mut fs = self.fs.lock().unwrap();
-        if fs
-            .add_directory_entry(parent_data.start_cluster, &entry)
-            .is_err()
-        {
-            reply.error(Errno::EIO);
+        if let Err(e) = fs.add_directory_entry(parent_data.start_cluster, &entry) {
+            let errno = if e.kind() == std::io::ErrorKind::StorageFull {
+                Errno::ENOSPC
+            } else {
+                Errno::EIO
+            };
+            reply.error(errno);
             return;
         }
 
@@ -561,11 +563,13 @@ impl Filesystem for FatxDriver {
             accessed_date: now_date,
         };
 
-        if fs
-            .add_directory_entry(parent_data.start_cluster, &entry)
-            .is_err()
-        {
-            reply.error(Errno::EIO);
+        if let Err(e) = fs.add_directory_entry(parent_data.start_cluster, &entry) {
+            let errno = if e.kind() == std::io::ErrorKind::StorageFull {
+                Errno::ENOSPC
+            } else {
+                Errno::EIO
+            };
+            reply.error(errno);
             return;
         }
 
@@ -787,11 +791,13 @@ impl Filesystem for FatxDriver {
             ..old_entry
         };
 
-        if fs
-            .add_directory_entry(newparent_data.start_cluster, &new_entry)
-            .is_err()
-        {
-            reply.error(Errno::EIO);
+        if let Err(e) = fs.add_directory_entry(newparent_data.start_cluster, &new_entry) {
+            let errno = if e.kind() == std::io::ErrorKind::StorageFull {
+                Errno::ENOSPC
+            } else {
+                Errno::EIO
+            };
+            reply.error(errno);
             return;
         }
 
