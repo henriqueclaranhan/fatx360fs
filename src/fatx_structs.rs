@@ -8,6 +8,16 @@ pub const FATX_END_OF_DIR_MARKER: u8 = 0xFF;
 pub const FATX_END_OF_DIR_MARKER2: u8 = 0x00;
 
 #[allow(dead_code)]
+pub const FATX_ATTR_READONLY: u8 = 0x01;
+#[allow(dead_code)]
+pub const FATX_ATTR_HIDDEN: u8 = 0x02;
+#[allow(dead_code)]
+pub const FATX_ATTR_SYSTEM: u8 = 0x04;
+pub const FATX_ATTR_DIRECTORY: u8 = 0x10;
+#[allow(dead_code)]
+pub const FATX_ATTR_ARCHIVE: u8 = 0x20;
+
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct FatxSuperblock {
     pub signature: u32,
@@ -51,12 +61,12 @@ pub struct FatxRawDirectoryEntry {
     pub filename: String,
     pub first_cluster: u32,
     pub file_size: u32,
-    pub modified_time: u16,
-    pub modified_date: u16,
-    pub created_time: u16,
     pub created_date: u16,
-    pub accessed_time: u16,
+    pub created_time: u16,
+    pub modified_date: u16,
+    pub modified_time: u16,
     pub accessed_date: u16,
+    pub accessed_time: u16,
 }
 
 impl FatxRawDirectoryEntry {
@@ -75,12 +85,12 @@ impl FatxRawDirectoryEntry {
 
         let first_cluster = cursor.read_u32::<BigEndian>()?;
         let file_size = cursor.read_u32::<BigEndian>()?;
-        let modified_time = cursor.read_u16::<BigEndian>()?;
-        let modified_date = cursor.read_u16::<BigEndian>()?;
-        let created_time = cursor.read_u16::<BigEndian>()?;
         let created_date = cursor.read_u16::<BigEndian>()?;
-        let accessed_time = cursor.read_u16::<BigEndian>()?;
+        let created_time = cursor.read_u16::<BigEndian>()?;
+        let modified_date = cursor.read_u16::<BigEndian>()?;
+        let modified_time = cursor.read_u16::<BigEndian>()?;
         let accessed_date = cursor.read_u16::<BigEndian>()?;
+        let accessed_time = cursor.read_u16::<BigEndian>()?;
 
         Ok(Self {
             filename_len,
@@ -88,12 +98,12 @@ impl FatxRawDirectoryEntry {
             filename,
             first_cluster,
             file_size,
-            modified_time,
-            modified_date,
-            created_time,
             created_date,
-            accessed_time,
+            created_time,
+            modified_date,
+            modified_time,
             accessed_date,
+            accessed_time,
         })
     }
 
@@ -110,12 +120,12 @@ impl FatxRawDirectoryEntry {
 
         cursor.write_u32::<BigEndian>(self.first_cluster).unwrap();
         cursor.write_u32::<BigEndian>(self.file_size).unwrap();
-        cursor.write_u16::<BigEndian>(self.modified_time).unwrap();
-        cursor.write_u16::<BigEndian>(self.modified_date).unwrap();
-        cursor.write_u16::<BigEndian>(self.created_time).unwrap();
         cursor.write_u16::<BigEndian>(self.created_date).unwrap();
-        cursor.write_u16::<BigEndian>(self.accessed_time).unwrap();
+        cursor.write_u16::<BigEndian>(self.created_time).unwrap();
+        cursor.write_u16::<BigEndian>(self.modified_date).unwrap();
+        cursor.write_u16::<BigEndian>(self.modified_time).unwrap();
         cursor.write_u16::<BigEndian>(self.accessed_date).unwrap();
+        cursor.write_u16::<BigEndian>(self.accessed_time).unwrap();
 
         data
     }
@@ -184,6 +194,58 @@ impl FatxRawDirectoryEntry {
             | ((minutes as u16 & 0x3F) << 5)
             | ((seconds as u16 / 2) & 0x1F);
 
-        (fat_time, fat_date)
+        (fat_date, fat_time)
+    }
+
+    pub fn fatx_datetime_to_systemtime(fat_date: u16, fat_time: u16) -> SystemTime {
+        if fat_date == 0 {
+            return UNIX_EPOCH;
+        }
+
+        let year = (((fat_date >> 9) & 0x7F) as i64) + 1980;
+        let month = ((fat_date >> 5) & 0x0F) as usize;
+        let day = (fat_date & 0x1F) as i64;
+
+        if month < 1 || month > 12 || day < 1 || day > 31 {
+            return UNIX_EPOCH;
+        }
+
+        let hours = ((fat_time >> 11) & 0x1F) as i64;
+        let minutes = ((fat_time >> 5) & 0x3F) as i64;
+        let seconds = ((fat_time & 0x1F) as i64) * 2;
+
+        let mut days = 0i64;
+        for y in 1970..year {
+            let is_leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+            days += if is_leap { 366 } else { 365 };
+        }
+
+        let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+        let days_in_month = [
+            31,
+            if is_leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+
+        for m in 1..month {
+            days += days_in_month[m - 1];
+        }
+        days += day - 1;
+
+        let total_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds;
+        if total_seconds < 0 {
+            return UNIX_EPOCH;
+        }
+
+        UNIX_EPOCH + std::time::Duration::from_secs(total_seconds as u64)
     }
 }

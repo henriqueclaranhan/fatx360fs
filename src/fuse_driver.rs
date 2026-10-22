@@ -1,4 +1,6 @@
-use crate::fatx_structs::FatxRawDirectoryEntry;
+use crate::fatx_structs::{
+    FatxRawDirectoryEntry, FATX_ATTR_DIRECTORY, FATX_ATTR_READONLY,
+};
 use crate::filesystem::FatxFileSystem;
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
@@ -12,8 +14,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const FATX_ATTR_DIRECTORY: u8 = 0x10;
-
 #[derive(Clone, Debug)]
 struct InodeData {
     ino: u64,
@@ -25,6 +25,10 @@ struct InodeData {
     is_dir: bool,
     lookup_count: u64,
     dirty: bool,
+    crtime: SystemTime,
+    mtime: SystemTime,
+    atime: SystemTime,
+    readonly: bool,
 }
 
 pub struct FatxDriver {
@@ -61,6 +65,10 @@ impl FatxDriver {
                 is_dir: true,
                 lookup_count: 1,
                 dirty: false,
+                crtime: UNIX_EPOCH,
+                mtime: UNIX_EPOCH,
+                atime: UNIX_EPOCH,
+                readonly: false,
             },
         );
 
@@ -77,20 +85,28 @@ impl FatxDriver {
     }
 
     fn make_attr(&self, data: &InodeData) -> FileAttr {
+        let perm = if data.is_dir {
+            0o755
+        } else if data.readonly {
+            0o444
+        } else {
+            0o644
+        };
+
         FileAttr {
             ino: INodeNo(data.ino),
             size: data.size as u64,
             blocks: (data.size as u64 + 511) / 512,
-            atime: UNIX_EPOCH,
-            mtime: UNIX_EPOCH,
-            ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            atime: data.atime,
+            mtime: data.mtime,
+            ctime: data.mtime,
+            crtime: data.crtime,
             kind: if data.is_dir {
                 FileType::Directory
             } else {
                 FileType::RegularFile
             },
-            perm: if data.is_dir { 0o755 } else { 0o644 },
+            perm,
             nlink: if data.is_dir { 2 } else { 1 },
             uid: self.uid,
             gid: self.gid,
@@ -109,7 +125,7 @@ impl FatxDriver {
 
         let mut fs = self.fs.lock().unwrap();
         let inodes = self.inodes.lock().unwrap();
-        let (mod_time, mod_date) =
+        let (mod_date, mod_time) =
             FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
 
         let mut synced_inos = Vec::new();
@@ -125,10 +141,10 @@ impl FatxDriver {
                         let mut updated = entry.clone();
                         updated.file_size = data.size;
                         updated.first_cluster = data.start_cluster;
-                        updated.modified_time = mod_time;
                         updated.modified_date = mod_date;
-                        updated.accessed_time = mod_time;
+                        updated.modified_time = mod_time;
                         updated.accessed_date = mod_date;
+                        updated.accessed_time = mod_time;
                         if fs
                             .update_directory_entry(data.parent_cluster, &data.name, &updated)
                             .is_ok()
@@ -164,27 +180,7 @@ impl Filesystem for FatxDriver {
 
         if let Some(data) = self.inodes.lock().unwrap().get_mut(&target_ino) {
             data.lookup_count += 1;
-            let attr = FileAttr {
-                ino: INodeNo(data.ino),
-                size: data.size as u64,
-                blocks: (data.size as u64 + 511) / 512,
-                atime: UNIX_EPOCH,
-                mtime: UNIX_EPOCH,
-                ctime: UNIX_EPOCH,
-                crtime: UNIX_EPOCH,
-                kind: if data.is_dir {
-                    FileType::Directory
-                } else {
-                    FileType::RegularFile
-                },
-                perm: if data.is_dir { 0o755 } else { 0o644 },
-                nlink: if data.is_dir { 2 } else { 1 },
-                uid: self.uid,
-                gid: self.gid,
-                rdev: 0,
-                blksize: 4096,
-                flags: 0,
-            };
+            let attr = self.make_attr(data);
             reply.entry(&Duration::from_secs(1), &attr, Generation(0));
             return;
         }
@@ -207,6 +203,20 @@ impl Filesystem for FatxDriver {
                 for entry in entries {
                     if entry.filename == name_str {
                         let is_dir = (entry.attributes & FATX_ATTR_DIRECTORY) != 0;
+                        let readonly = (entry.attributes & FATX_ATTR_READONLY) != 0;
+                        let crtime = FatxRawDirectoryEntry::fatx_datetime_to_systemtime(
+                            entry.created_date,
+                            entry.created_time,
+                        );
+                        let mtime = FatxRawDirectoryEntry::fatx_datetime_to_systemtime(
+                            entry.modified_date,
+                            entry.modified_time,
+                        );
+                        let atime = FatxRawDirectoryEntry::fatx_datetime_to_systemtime(
+                            entry.accessed_date,
+                            entry.accessed_time,
+                        );
+
                         let new_data = InodeData {
                             ino: target_ino,
                             parent_ino: parent,
@@ -217,6 +227,10 @@ impl Filesystem for FatxDriver {
                             is_dir,
                             lookup_count: 1,
                             dirty: false,
+                            crtime,
+                            mtime,
+                            atime,
+                            readonly,
                         };
 
                         let attr = self.make_attr(&new_data);
@@ -400,10 +414,13 @@ impl Filesystem for FatxDriver {
         match fs.write_file_data(inode_data.start_cluster, offset, data) {
             Ok((new_start_cluster, _)) => {
                 let new_size = std::cmp::max(inode_data.size, (offset + data.len() as u64) as u32);
+                let now = SystemTime::now();
 
                 if let Some(d) = self.inodes.lock().unwrap().get_mut(&ino_u64) {
                     d.size = new_size;
                     d.start_cluster = new_start_cluster;
+                    d.mtime = now;
+                    d.atime = now;
                     d.dirty = true;
                 }
                 self.dirty_inodes.lock().unwrap().insert(ino_u64);
@@ -444,8 +461,9 @@ impl Filesystem for FatxDriver {
         };
 
         let target_ino = generate_ino(parent_u64, &name_str);
-        let (now_time, now_date) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
+        let now = SystemTime::now();
+        let (now_date, now_time) =
+            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
 
         let entry = FatxRawDirectoryEntry {
             filename_len: name_str.len() as u8,
@@ -453,12 +471,12 @@ impl Filesystem for FatxDriver {
             filename: name_str.clone(),
             first_cluster: 0,
             file_size: 0,
-            modified_time: now_time,
-            modified_date: now_date,
-            created_time: now_time,
             created_date: now_date,
-            accessed_time: now_time,
+            created_time: now_time,
+            modified_date: now_date,
+            modified_time: now_time,
             accessed_date: now_date,
+            accessed_time: now_time,
         };
 
         let mut fs = self.fs.lock().unwrap();
@@ -487,6 +505,10 @@ impl Filesystem for FatxDriver {
             is_dir: false,
             lookup_count: 1,
             dirty: false,
+            crtime: now,
+            mtime: now,
+            atime: now,
+            readonly: false,
         };
         let attr = self.make_attr(&new_data);
         self.inodes.lock().unwrap().insert(target_ino, new_data);
@@ -546,8 +568,9 @@ impl Filesystem for FatxDriver {
             return;
         }
 
-        let (now_time, now_date) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
+        let now = SystemTime::now();
+        let (now_date, now_time) =
+            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
 
         let entry = FatxRawDirectoryEntry {
             filename_len: name_str.len() as u8,
@@ -555,12 +578,12 @@ impl Filesystem for FatxDriver {
             filename: name_str.clone(),
             first_cluster: new_cluster,
             file_size: 0,
-            modified_time: now_time,
-            modified_date: now_date,
-            created_time: now_time,
             created_date: now_date,
-            accessed_time: now_time,
+            created_time: now_time,
+            modified_date: now_date,
+            modified_time: now_time,
             accessed_date: now_date,
+            accessed_time: now_time,
         };
 
         if let Err(e) = fs.add_directory_entry(parent_data.start_cluster, &entry) {
@@ -588,6 +611,10 @@ impl Filesystem for FatxDriver {
             is_dir: true,
             lookup_count: 1,
             dirty: false,
+            crtime: now,
+            mtime: now,
+            atime: now,
+            readonly: false,
         };
         let attr = self.make_attr(&new_data);
         self.inodes.lock().unwrap().insert(target_ino, new_data);
@@ -779,15 +806,16 @@ impl Filesystem for FatxDriver {
             }
         }
 
-        let (mod_time, mod_date) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
+        let now = SystemTime::now();
+        let (mod_date, mod_time) =
+            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
         let new_entry = FatxRawDirectoryEntry {
             filename_len: newname_str.len() as u8,
             filename: newname_str.clone(),
-            modified_time: mod_time,
             modified_date: mod_date,
-            accessed_time: mod_time,
+            modified_time: mod_time,
             accessed_date: mod_date,
+            accessed_time: mod_time,
             ..old_entry
         };
 
@@ -825,6 +853,8 @@ impl Filesystem for FatxDriver {
             data.parent_ino = newparent_u64;
             data.parent_cluster = newparent_data.start_cluster;
             data.name = newname_str;
+            data.mtime = now;
+            data.atime = now;
             inodes.insert(new_ino, data);
         }
 
@@ -883,15 +913,19 @@ impl Filesystem for FatxDriver {
                 }
             }
 
+            let now = SystemTime::now();
+            let (mod_date, mod_time) =
+                FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+
             if let Ok(entries) = fs.read_directory(inode_data.parent_cluster) {
                 if let Some(entry) = entries.iter().find(|e| e.filename == inode_data.name) {
-                    let (mod_time, mod_date) =
-                        FatxRawDirectoryEntry::systemtime_to_fatx_datetime(SystemTime::now());
                     let mut updated = entry.clone();
                     updated.file_size = inode_data.size;
                     updated.first_cluster = inode_data.start_cluster;
-                    updated.modified_time = mod_time;
                     updated.modified_date = mod_date;
+                    updated.modified_time = mod_time;
+                    updated.accessed_date = mod_date;
+                    updated.accessed_time = mod_time;
                     let _ = fs.update_directory_entry(
                         inode_data.parent_cluster,
                         &inode_data.name,
@@ -900,9 +934,13 @@ impl Filesystem for FatxDriver {
                 }
             }
 
+            inode_data.mtime = now;
+            inode_data.atime = now;
             if let Some(d) = self.inodes.lock().unwrap().get_mut(&ino_u64) {
                 d.size = inode_data.size;
                 d.start_cluster = inode_data.start_cluster;
+                d.mtime = now;
+                d.atime = now;
                 d.dirty = false;
             }
             self.dirty_inodes.lock().unwrap().remove(&ino_u64);
