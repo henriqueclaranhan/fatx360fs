@@ -1,5 +1,5 @@
 use crate::fatx_structs::{
-    is_valid_fatx_filename, FatxRawDirectoryEntry, FATX_ATTR_DIRECTORY, FATX_ATTR_READONLY,
+    FATX_ATTR_DIRECTORY, FATX_ATTR_READONLY, FatxRawDirectoryEntry, is_valid_fatx_filename,
 };
 use crate::filesystem::FatxFileSystem;
 use fuser::{
@@ -43,7 +43,7 @@ pub struct FatxDriver {
 fn generate_ino(parent_ino: u64, name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     parent_ino.hash(&mut hasher);
-    name.hash(&mut hasher);
+    name.to_ascii_uppercase().hash(&mut hasher);
     let mut hash = hasher.finish();
     if hash == 1 {
         hash = 2;
@@ -139,7 +139,10 @@ impl FatxDriver {
                     continue;
                 }
                 if let Ok(entries) = fs.read_directory(data.parent_cluster) {
-                    if let Some(entry) = entries.iter().find(|e| e.filename == data.name) {
+                    if let Some(entry) = entries
+                        .iter()
+                        .find(|e| e.filename.eq_ignore_ascii_case(&data.name))
+                    {
                         let mut updated = entry.clone();
                         updated.file_size = data.size;
                         updated.first_cluster = data.start_cluster;
@@ -203,7 +206,7 @@ impl Filesystem for FatxDriver {
         {
             Ok(entries) => {
                 for entry in entries {
-                    if entry.filename == name_str {
+                    if entry.filename.eq_ignore_ascii_case(&name_str) {
                         let is_dir = (entry.attributes & FATX_ATTR_DIRECTORY) != 0;
                         let readonly = (entry.attributes & FATX_ATTR_READONLY) != 0;
                         let crtime = FatxRawDirectoryEntry::fatx_datetime_to_systemtime(
@@ -219,24 +222,30 @@ impl Filesystem for FatxDriver {
                             entry.accessed_time,
                         );
 
-                        let new_data = InodeData {
-                            ino: target_ino,
-                            parent_ino: parent,
-                            parent_cluster: parent_data.start_cluster,
-                            name: entry.filename.clone(),
-                            start_cluster: entry.first_cluster,
-                            size: entry.file_size,
-                            is_dir,
-                            lookup_count: 1,
-                            dirty: false,
-                            crtime,
-                            mtime,
-                            atime,
-                            readonly,
+                        let mut inodes = self.inodes.lock().unwrap();
+                        let attr = if let Some(existing) = inodes.get_mut(&target_ino) {
+                            existing.lookup_count += 1;
+                            self.make_attr(existing)
+                        } else {
+                            let new_data = InodeData {
+                                ino: target_ino,
+                                parent_ino: parent,
+                                parent_cluster: parent_data.start_cluster,
+                                name: entry.filename.clone(),
+                                start_cluster: entry.first_cluster,
+                                size: entry.file_size,
+                                is_dir,
+                                lookup_count: 1,
+                                dirty: false,
+                                crtime,
+                                mtime,
+                                atime,
+                                readonly,
+                            };
+                            let attr = self.make_attr(&new_data);
+                            inodes.insert(target_ino, new_data);
+                            attr
                         };
-
-                        let attr = self.make_attr(&new_data);
-                        self.inodes.lock().unwrap().insert(target_ino, new_data);
 
                         reply.entry(&Duration::from_secs(1), &attr, Generation(0));
                         return;
@@ -483,10 +492,26 @@ impl Filesystem for FatxDriver {
             }
         };
 
+        let mut fs = self.fs.lock().unwrap();
+        let entries = match fs.read_directory(parent_data.start_cluster) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        if entries
+            .iter()
+            .any(|e| e.filename.eq_ignore_ascii_case(&name_str))
+        {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
         let target_ino = generate_ino(parent_u64, &name_str);
         let now = SystemTime::now();
-        let (now_date, now_time) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+        let (now_date, now_time) = FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
 
         let entry = FatxRawDirectoryEntry {
             filename_len: name_str.len() as u8,
@@ -502,7 +527,6 @@ impl Filesystem for FatxDriver {
             accessed_time: now_time,
         };
 
-        let mut fs = self.fs.lock().unwrap();
         if let Err(e) = fs.add_directory_entry(parent_data.start_cluster, &entry) {
             let errno = if e.kind() == std::io::ErrorKind::StorageFull {
                 Errno::ENOSPC
@@ -583,9 +607,25 @@ impl Filesystem for FatxDriver {
             }
         };
 
+        let mut fs = self.fs.lock().unwrap();
+        let entries = match fs.read_directory(parent_data.start_cluster) {
+            Ok(e) => e,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+
+        if entries
+            .iter()
+            .any(|e| e.filename.eq_ignore_ascii_case(&name_str))
+        {
+            reply.error(Errno::EEXIST);
+            return;
+        }
+
         let target_ino = generate_ino(parent_u64, &name_str);
 
-        let mut fs = self.fs.lock().unwrap();
         let new_cluster = match fs.allocate_cluster() {
             Ok(c) => c,
             Err(_) => {
@@ -602,8 +642,7 @@ impl Filesystem for FatxDriver {
         }
 
         let now = SystemTime::now();
-        let (now_date, now_time) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+        let (now_date, now_time) = FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
 
         let entry = FatxRawDirectoryEntry {
             filename_len: name_str.len() as u8,
@@ -676,8 +715,17 @@ impl Filesystem for FatxDriver {
         let mut fs = self.fs.lock().unwrap();
 
         let target_cluster = match fs.read_directory(parent_data.start_cluster) {
-            Ok(entries) => match entries.iter().find(|e| e.filename == name_str) {
-                Some(entry) => entry.first_cluster,
+            Ok(entries) => match entries
+                .iter()
+                .find(|e| e.filename.eq_ignore_ascii_case(&name_str))
+            {
+                Some(entry) => {
+                    if (entry.attributes & FATX_ATTR_DIRECTORY) != 0 {
+                        reply.error(Errno::EISDIR);
+                        return;
+                    }
+                    entry.first_cluster
+                }
                 None => {
                     reply.error(Errno::ENOENT);
                     return;
@@ -732,7 +780,10 @@ impl Filesystem for FatxDriver {
         let mut fs = self.fs.lock().unwrap();
 
         let target_cluster = match fs.read_directory(parent_data.start_cluster) {
-            Ok(entries) => match entries.iter().find(|e| e.filename == name_str) {
+            Ok(entries) => match entries
+                .iter()
+                .find(|e| e.filename.eq_ignore_ascii_case(&name_str))
+            {
                 Some(entry) => {
                     if (entry.attributes & FATX_ATTR_DIRECTORY) == 0 {
                         reply.error(Errno::ENOTDIR);
@@ -834,7 +885,10 @@ impl Filesystem for FatxDriver {
         let mut fs = self.fs.lock().unwrap();
 
         let old_entry = match fs.read_directory(parent_data.start_cluster) {
-            Ok(entries) => match entries.into_iter().find(|e| e.filename == name_str) {
+            Ok(entries) => match entries
+                .into_iter()
+                .find(|e| e.filename.eq_ignore_ascii_case(&name_str))
+            {
                 Some(entry) => entry,
                 None => {
                     reply.error(Errno::ENOENT);
@@ -847,21 +901,81 @@ impl Filesystem for FatxDriver {
             }
         };
 
+        let is_same_dir_case_rename =
+            parent_u64 == newparent_u64 && name_str.eq_ignore_ascii_case(&newname_str);
+
+        if is_same_dir_case_rename {
+            let now = SystemTime::now();
+            let (mod_date, mod_time) = FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+            let new_entry = FatxRawDirectoryEntry {
+                filename_len: newname_str.len() as u8,
+                filename: newname_str.clone(),
+                modified_date: mod_date,
+                modified_time: mod_time,
+                accessed_date: mod_date,
+                accessed_time: mod_time,
+                ..old_entry
+            };
+
+            if fs
+                .update_directory_entry(parent_data.start_cluster, &old_entry.filename, &new_entry)
+                .is_err()
+            {
+                reply.error(Errno::EIO);
+                return;
+            }
+
+            let _ = fs.flush_fat();
+
+            let ino = generate_ino(parent_u64, &name_str);
+            let mut inodes = self.inodes.lock().unwrap();
+            if let Some(data) = inodes.get_mut(&ino) {
+                data.name = newname_str;
+                data.mtime = now;
+                data.atime = now;
+            }
+
+            reply.ok();
+            return;
+        }
+
         if let Ok(new_entries) = fs.read_directory(newparent_data.start_cluster) {
-            if let Some(existing) = new_entries.iter().find(|e| e.filename == newname_str) {
+            if let Some(existing) = new_entries
+                .iter()
+                .find(|e| e.filename.eq_ignore_ascii_case(&newname_str))
+            {
+                let is_existing_dir = (existing.attributes & FATX_ATTR_DIRECTORY) != 0;
+                let is_old_dir = (old_entry.attributes & FATX_ATTR_DIRECTORY) != 0;
+
+                if is_old_dir && !is_existing_dir {
+                    reply.error(Errno::ENOTDIR);
+                    return;
+                }
+                if !is_old_dir && is_existing_dir {
+                    reply.error(Errno::EISDIR);
+                    return;
+                }
+                if is_existing_dir {
+                    if let Ok(sub) = fs.read_directory(existing.first_cluster) {
+                        if !sub.is_empty() {
+                            reply.error(Errno::ENOTEMPTY);
+                            return;
+                        }
+                    }
+                }
+
                 if existing.first_cluster != 0 {
                     let _ = fs.free_chain(existing.first_cluster);
                 }
-                let _ = fs.remove_directory_entry(newparent_data.start_cluster, &newname_str);
-                let existing_ino = generate_ino(newparent_u64, &newname_str);
+                let _ = fs.remove_directory_entry(newparent_data.start_cluster, &existing.filename);
+                let existing_ino = generate_ino(newparent_u64, &existing.filename);
                 self.dirty_inodes.lock().unwrap().remove(&existing_ino);
                 self.inodes.lock().unwrap().remove(&existing_ino);
             }
         }
 
         let now = SystemTime::now();
-        let (mod_date, mod_time) =
-            FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+        let (mod_date, mod_time) = FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
         let new_entry = FatxRawDirectoryEntry {
             filename_len: newname_str.len() as u8,
             filename: newname_str.clone(),
@@ -883,7 +997,7 @@ impl Filesystem for FatxDriver {
         }
 
         if fs
-            .remove_directory_entry(parent_data.start_cluster, &name_str)
+            .remove_directory_entry(parent_data.start_cluster, &old_entry.filename)
             .is_err()
         {
             reply.error(Errno::EIO);
@@ -977,11 +1091,13 @@ impl Filesystem for FatxDriver {
             }
 
             let now = SystemTime::now();
-            let (mod_date, mod_time) =
-                FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
+            let (mod_date, mod_time) = FatxRawDirectoryEntry::systemtime_to_fatx_datetime(now);
 
             if let Ok(entries) = fs.read_directory(inode_data.parent_cluster) {
-                if let Some(entry) = entries.iter().find(|e| e.filename == inode_data.name) {
+                if let Some(entry) = entries
+                    .iter()
+                    .find(|e| e.filename.eq_ignore_ascii_case(&inode_data.name))
+                {
                     let mut updated = entry.clone();
                     updated.file_size = inode_data.size;
                     updated.first_cluster = inode_data.start_cluster;
@@ -991,7 +1107,7 @@ impl Filesystem for FatxDriver {
                     updated.accessed_time = mod_time;
                     let _ = fs.update_directory_entry(
                         inode_data.parent_cluster,
-                        &inode_data.name,
+                        &entry.filename,
                         &updated,
                     );
                 }

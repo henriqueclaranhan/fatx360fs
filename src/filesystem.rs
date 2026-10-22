@@ -180,13 +180,13 @@ impl FatxFileSystem {
             return Ok(Some(start_cluster));
         }
 
-        let (mut current_idx, mut current_cluster) =
-            match self.cluster_chain_hints.get(&start_cluster) {
-                Some(&(hint_idx, hint_cluster)) if hint_idx <= target_idx => {
-                    (hint_idx, hint_cluster)
-                }
-                _ => (0, start_cluster),
-            };
+        let (mut current_idx, mut current_cluster) = match self
+            .cluster_chain_hints
+            .get(&start_cluster)
+        {
+            Some(&(hint_idx, hint_cluster)) if hint_idx <= target_idx => (hint_idx, hint_cluster),
+            _ => (0, start_cluster),
+        };
 
         while current_idx < target_idx {
             match self.get_next_cluster(current_cluster)? {
@@ -216,10 +216,11 @@ impl FatxFileSystem {
         let start_cluster_idx = (offset / self.cluster_size) as usize;
         let mut current_offset_in_cluster = (offset % self.cluster_size) as usize;
 
-        let mut current_cluster = match self.find_cluster_at_index(start_cluster, start_cluster_idx)? {
-            Some(c) => c,
-            None => return Ok(Vec::new()),
-        };
+        let mut current_cluster =
+            match self.find_cluster_at_index(start_cluster, start_cluster_idx)? {
+                Some(c) => c,
+                None => return Ok(Vec::new()),
+            };
 
         let mut current_cluster_idx = start_cluster_idx;
         let mut data = Vec::with_capacity(size as usize);
@@ -643,7 +644,7 @@ impl FatxFileSystem {
                 let mut entry_data = [0u8; 64];
                 entry_data.copy_from_slice(&data[i..i + 64]);
                 if let Ok(entry) = FatxRawDirectoryEntry::read_from(&entry_data) {
-                    if entry.filename == filename {
+                    if entry.filename.eq_ignore_ascii_case(filename) {
                         data[i] = FATX_DELETED_FILE_MARKER;
                         modified = true;
                         break;
@@ -686,7 +687,7 @@ impl FatxFileSystem {
                 let mut entry_data = [0u8; 64];
                 entry_data.copy_from_slice(&data[i..i + 64]);
                 if let Ok(entry) = FatxRawDirectoryEntry::read_from(&entry_data) {
-                    if entry.filename == filename {
+                    if entry.filename.eq_ignore_ascii_case(filename) {
                         data[i..i + 64].copy_from_slice(&serialized_entry);
                         modified = true;
                         break;
