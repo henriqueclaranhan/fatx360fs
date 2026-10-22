@@ -17,6 +17,24 @@ pub const FATX_ATTR_DIRECTORY: u8 = 0x10;
 #[allow(dead_code)]
 pub const FATX_ATTR_ARCHIVE: u8 = 0x20;
 
+pub fn is_valid_fatx_filename(name: &str) -> bool {
+    if name.is_empty() || name.len() > 42 {
+        return false;
+    }
+    if !name.is_ascii() {
+        return false;
+    }
+    const ILLEGAL_CHARS: &[char] = &[
+        '"', '*', '+', ',', '/', ':', ';', '<', '=', '>', '?', '\\', '|',
+    ];
+    for c in name.chars() {
+        if (c as u32) < 32 || ILLEGAL_CHARS.contains(&c) {
+            return false;
+        }
+    }
+    true
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct FatxSuperblock {

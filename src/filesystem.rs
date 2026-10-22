@@ -23,6 +23,7 @@ pub struct FatxFileSystem {
     pub cluster_size: u64,
     pub fat_data: Vec<u8>,
     pub next_free_cluster: u32,
+    pub free_clusters: u32,
 }
 
 impl FatxFileSystem {
@@ -75,6 +76,20 @@ impl FatxFileSystem {
         device.seek(SeekFrom::Start(fat_offset))?;
         device.read_exact(&mut fat_data)?;
 
+        let entry_size = if is_fat32 { 4 } else { 2 };
+        let mut free_clusters = 0u32;
+        for cluster in 2..=num_clusters {
+            let index = cluster as usize * entry_size;
+            let value = if is_fat32 {
+                u32::from_be_bytes(fat_data[index..index + 4].try_into().unwrap())
+            } else {
+                u16::from_be_bytes(fat_data[index..index + 2].try_into().unwrap()) as u32
+            };
+            if value == 0 {
+                free_clusters += 1;
+            }
+        }
+
         Ok(Self {
             device,
             superblock,
@@ -86,6 +101,7 @@ impl FatxFileSystem {
             cluster_size,
             fat_data,
             next_free_cluster: 2,
+            free_clusters,
         })
     }
 
@@ -260,6 +276,18 @@ impl FatxFileSystem {
                 io::ErrorKind::InvalidInput,
                 "Cluster out of bounds",
             ));
+        }
+
+        let old_value = if self.is_fat32 {
+            u32::from_be_bytes(self.fat_data[index..index + 4].try_into().unwrap())
+        } else {
+            u16::from_be_bytes(self.fat_data[index..index + 2].try_into().unwrap()) as u32
+        };
+
+        if old_value == 0 && value != 0 {
+            self.free_clusters = self.free_clusters.saturating_sub(1);
+        } else if old_value != 0 && value == 0 {
+            self.free_clusters += 1;
         }
 
         if self.is_fat32 {

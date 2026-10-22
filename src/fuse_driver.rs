@@ -1,11 +1,11 @@
 use crate::fatx_structs::{
-    FatxRawDirectoryEntry, FATX_ATTR_DIRECTORY, FATX_ATTR_READONLY,
+    is_valid_fatx_filename, FatxRawDirectoryEntry, FATX_ATTR_DIRECTORY, FATX_ATTR_READONLY,
 };
 use crate::filesystem::FatxFileSystem;
 use fuser::{
     BsdFileFlags, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation,
     INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -37,6 +37,7 @@ pub struct FatxDriver {
     dirty_inodes: Mutex<HashSet<u64>>,
     uid: u32,
     gid: u32,
+    pub readonly: bool,
 }
 
 fn generate_ino(parent_ino: u64, name: &str) -> u64 {
@@ -51,7 +52,7 @@ fn generate_ino(parent_ino: u64, name: &str) -> u64 {
 }
 
 impl FatxDriver {
-    pub fn new(fs: FatxFileSystem) -> Self {
+    pub fn new(fs: FatxFileSystem, readonly: bool) -> Self {
         let mut inodes = HashMap::new();
         inodes.insert(
             1,
@@ -81,6 +82,7 @@ impl FatxDriver {
             dirty_inodes: Mutex::new(HashSet::new()),
             uid,
             gid,
+            readonly,
         }
     }
 
@@ -396,6 +398,11 @@ impl Filesystem for FatxDriver {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let ino_u64: u64 = ino.into();
         let inode_data = match self.inodes.lock().unwrap().get(&ino_u64) {
             Some(d) => d.clone(),
@@ -410,10 +417,16 @@ impl Filesystem for FatxDriver {
             return;
         }
 
+        let new_size_u64 = offset.saturating_add(data.len() as u64);
+        if new_size_u64 > u32::MAX as u64 {
+            reply.error(Errno::EFBIG);
+            return;
+        }
+
         let mut fs = self.fs.lock().unwrap();
         match fs.write_file_data(inode_data.start_cluster, offset, data) {
             Ok((new_start_cluster, _)) => {
-                let new_size = std::cmp::max(inode_data.size, (offset + data.len() as u64) as u32);
+                let new_size = std::cmp::max(inode_data.size, new_size_u64 as u32);
                 let now = SystemTime::now();
 
                 if let Some(d) = self.inodes.lock().unwrap().get_mut(&ino_u64) {
@@ -441,9 +454,19 @@ impl Filesystem for FatxDriver {
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let name_str = name.to_string_lossy().to_string();
-        if name_str.len() > 42 || !name_str.is_ascii() {
-            reply.error(Errno::ENAMETOOLONG);
+        if !is_valid_fatx_filename(&name_str) {
+            let errno = if name_str.len() > 42 {
+                Errno::ENAMETOOLONG
+            } else {
+                Errno::EINVAL
+            };
+            reply.error(errno);
             return;
         }
 
@@ -531,9 +554,19 @@ impl Filesystem for FatxDriver {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let name_str = name.to_string_lossy().to_string();
-        if name_str.len() > 42 || !name_str.is_ascii() {
-            reply.error(Errno::ENAMETOOLONG);
+        if !is_valid_fatx_filename(&name_str) {
+            let errno = if name_str.len() > 42 {
+                Errno::ENAMETOOLONG
+            } else {
+                Errno::EINVAL
+            };
+            reply.error(errno);
             return;
         }
 
@@ -623,6 +656,11 @@ impl Filesystem for FatxDriver {
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let name_str = name.to_string_lossy().to_string();
         let parent_u64: u64 = parent.into();
         let target_ino = generate_ino(parent_u64, &name_str);
@@ -674,6 +712,11 @@ impl Filesystem for FatxDriver {
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let name_str = name.to_string_lossy().to_string();
         let parent_u64: u64 = parent.into();
         let target_ino = generate_ino(parent_u64, &name_str);
@@ -753,10 +796,20 @@ impl Filesystem for FatxDriver {
         _flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let name_str = name.to_string_lossy().to_string();
         let newname_str = newname.to_string_lossy().to_string();
-        if newname_str.len() > 42 || !newname_str.is_ascii() {
-            reply.error(Errno::ENAMETOOLONG);
+        if !is_valid_fatx_filename(&newname_str) {
+            let errno = if newname_str.len() > 42 {
+                Errno::ENAMETOOLONG
+            } else {
+                Errno::EINVAL
+            };
+            reply.error(errno);
             return;
         }
 
@@ -879,6 +932,11 @@ impl Filesystem for FatxDriver {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        if self.readonly {
+            reply.error(Errno::EROFS);
+            return;
+        }
+
         let ino_u64: u64 = ino.into();
         let mut inode_data = match self.inodes.lock().unwrap().get(&ino_u64) {
             Some(d) => d.clone(),
@@ -891,6 +949,11 @@ impl Filesystem for FatxDriver {
         if let Some(new_size) = size {
             if inode_data.is_dir {
                 reply.error(Errno::EISDIR);
+                return;
+            }
+
+            if new_size > u32::MAX as u64 {
+                reply.error(Errno::EFBIG);
                 return;
             }
 
@@ -988,6 +1051,24 @@ impl Filesystem for FatxDriver {
         } else {
             reply.error(Errno::EIO);
         }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        let fs = self.fs.lock().unwrap();
+        let cluster_size = fs.cluster_size as u32;
+        let total_blocks = fs.num_clusters as u64;
+        let free_blocks = fs.free_clusters as u64;
+
+        reply.statfs(
+            total_blocks,
+            free_blocks,
+            free_blocks,
+            fs.num_clusters as u64,
+            free_blocks,
+            cluster_size,
+            42,
+            cluster_size,
+        );
     }
 
     fn destroy(&mut self) {

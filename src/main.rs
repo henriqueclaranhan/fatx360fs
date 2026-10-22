@@ -59,7 +59,7 @@ fn main() {
         if readonly { "read-only" } else { "read-write" }
     );
 
-    let driver = fuse_driver::FatxDriver::new(fs);
+    let driver = fuse_driver::FatxDriver::new(fs, readonly);
 
     let mut options = vec![MountOption::FSName("fatx360fs".to_string())];
 
